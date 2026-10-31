@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+"""Small, unprivileged Linux resource monitor; no elevated process control."""
+import argparse
+import curses
+import os
+from pathlib import Path
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+
+def read_cpu(previous):
+    values = [int(v) for v in Path('/proc/stat').read_text().splitlines()[0].split()[1:]]
+    # guest/guest_nice are already included in user/nice.
+    total, idle = sum(values[:8]), sum(values[3:5])
+    delta = total - previous[0] if previous else 0
+    usage = 100 * (1 - (idle - previous[1]) / delta) if delta > 0 else 0
+    return max(0, min(100, usage)), (total, idle)
+
+
+def read_memory():
+    values = {k: int(v.split()[0]) * 1024 for k, v in
+              (line.split(':', 1) for line in Path('/proc/meminfo').read_text().splitlines())}
+    total = values['MemTotal']
+    return total - values.get('MemAvailable', values.get('MemFree', 0)), total
+
+
+def process_details(pid):
+    """Read identity and display name together, not from different PID lifetimes."""
+    data = Path('/proc/{}/stat'.format(pid)).read_text()
+    prefix, suffix = data.rsplit(')', 1)
+    fields = suffix.split()
+    return (int(pid), int(fields[19])), prefix.split('(', 1)[1], fields[0]
+
+
+def process_identity(pid):
+    """PID plus start time distinguishes a process from a recycled PID."""
+    return process_details(pid)[0]
+
+
+def processes():
+    output = subprocess.check_output(
+        ['ps', '-eo', 'pid=,pcpu=,pmem=,stat=,comm=', '--sort=-pcpu'], text=True)
+    rows = []
+    for line in output.splitlines():
+        fields = line.split(None, 4)
+        if len(fields) != 5:
+            continue
+        try:
+            identity, fields[4], fields[3] = process_details(int(fields[0]))
+        except (OSError, ValueError, IndexError):
+            continue
+        rows.append((identity, fields))
+    return rows
+
+
+def selected_index(rows, identity):
+    return next((i for i, row in enumerate(rows) if row[0] == identity), None)
+
+
+def stop_process(identity):
+    """Bind the signal to the process opened, never fall back to kill(pid)."""
+    pid, _ = identity
+    if pid <= 1 or pid == os.getpid():
+        return 'Refusing to stop PID 1 or this monitor.'
+    if not hasattr(os, 'pidfd_open') or not hasattr(signal, 'pidfd_send_signal'):
+        return 'Safe process stopping is unavailable on this Python/kernel.'
+    descriptor = None
+    try:
+        descriptor = os.pidfd_open(pid)
+        if process_identity(pid) != identity:
+            return 'Process changed or exited; nothing was stopped.'
+        signal.pidfd_send_signal(descriptor, signal.SIGTERM)
+        return 'SIGTERM sent to PID {}.'.format(pid)
+    except (ProcessLookupError, FileNotFoundError):
+        return 'Process exited; nothing was stopped.'
+    except PermissionError:
+        return 'Permission denied. Run this monitor as your normal user.'
+    except (OSError, ValueError, IndexError) as error:
+        return 'Could not safely stop process: {}'.format(error)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def put(screen, y, x, text, attr=0):
+    height, width = screen.getmaxyx()
+    if y < 0 or y >= height or x < 0 or x >= width - 1:
+        return
+    try:
+        screen.addnstr(y, x, text, width - x - 1, attr)
+    except curses.error:
+        pass  # Terminal can resize between measurement and drawing.
+
+
+def viewport(index, offset, count):
+    if index is None or count <= 0:
+        return max(0, offset)
+    return max(0, min(offset, index)) if index < offset + count else index - count + 1
+
+
+def request_quit():
+    path = os.environ.get('RESOURCE_MONITOR_QUIT_FILE')
+    if path:
+        Path(path).write_text('quit\n')
+
+
+def main(screen):
+    try:
+        curses.curs_set(0)
+    except curses.error:
+        pass
+    screen.keypad(True)
+    screen.timeout(200)
+    try:
+        curses.mousemask(curses.ALL_MOUSE_EVENTS)
+        curses.mouseinterval(0)
+    except curses.error:
+        pass
+    identity = pending = None
+    rows, previous = [], None
+    last_refresh, offset = float('-inf'), 0
+    cpu = used = total = disk_percent = 0
+    message = 'CPU per process is a lifetime average. Select a row to stop it.'
+    hit_rows, buttons = {}, []
+    while True:
+        # Handle input against the identity of the last DISPLAYED selection.
+        key = screen.getch()
+        height, width = screen.getmaxyx()
+        usable = height >= 10 and width >= 42
+        if not usable:
+            pending = None
+        action = None
+        if key == ord('q'):
+            action = 'quit'
+        elif key == 27:
+            if pending:
+                pending = None
+            else:
+                return
+        elif usable and key == ord('K'):
+            action = 'stop'
+        elif key in (ord('y'), ord('Y')) and pending:
+            action = 'confirm'
+        elif key in (ord('n'), ord('N')) and pending:
+            action = 'cancel'
+        elif usable and key == curses.KEY_MOUSE:
+            try:
+                _, x, y, _, state = curses.getmouse()
+                if not pending and state & curses.BUTTON4_PRESSED:
+                    action = 'up'
+                elif not pending and state & getattr(curses, 'BUTTON5_PRESSED', 0):
+                    action = 'down'
+                elif state & curses.BUTTON1_RELEASED:
+                    action = next((a for left, right, row, a in buttons if row == y and left <= x < right), None)
+                    if y in hit_rows and not pending:
+                        identity = hit_rows[y]
+            except curses.error:
+                pass
+        elif usable and not pending and key in (curses.KEY_DOWN, ord('j'), curses.KEY_UP, ord('k')) and rows:
+            action = 'down' if key in (curses.KEY_DOWN, ord('j')) else 'up'
+        if action in ('up', 'down') and not pending and rows:
+            index = selected_index(rows, identity)
+            step = 1 if action == 'down' else -1
+            index = 0 if index is None else max(0, min(len(rows) - 1, index + step))
+            identity = rows[index][0]
+        if action == 'quit':
+            try:
+                request_quit()
+            except OSError as error:
+                message = 'Could not quit both components: {}'.format(error)
+            else:
+                return
+        if action == 'cancel':
+            pending = None
+        if action == 'stop' and not pending:
+            index = selected_index(rows, identity)
+            if index is not None:
+                pending = (identity, rows[index][1][4])
+        elif action == 'confirm' and pending:
+            message = stop_process(pending[0])
+            pending = None
+            last_refresh = 0
+        now = time.monotonic()
+        if now - last_refresh >= 1:
+            try:
+                cpu, previous = read_cpu(previous)
+                used, total = read_memory()
+                disk = shutil.disk_usage('/')
+                disk_percent = disk.used / disk.total * 100
+                rows = processes()
+                if identity is not None and selected_index(rows, identity) is None:
+                    identity = None
+                last_refresh = now
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                message = 'Refresh failed: {}'.format(error)
+                last_refresh = now
+        height, width = screen.getmaxyx()
+        screen.erase()
+        hit_rows, buttons = {}, []
+        if height < 10 or width < 42:
+            put(screen, 0, 0, 'Resource Monitor: enlarge window (42x10).')
+            put(screen, 1, 0, 'q: quit both; Esc: close window')
+            # No destructive controls while confirmation details cannot fit.
+            pending = None
+            screen.refresh()
+            continue
+        put(screen, 0, 0, 'RESOURCE MONITOR', curses.A_BOLD)
+        put(screen, 1, 0, 'CPU {:5.1f}%  RAM {:5.1f}%  Disk {:5.1f}%'.format(cpu, used / total * 100 if total else 0, disk_percent))
+        put(screen, 2, 0, 'RAM {:.1f} / {:.1f} GiB'.format(used / 1024**3, total / 1024**3))
+        put(screen, 3, 0, ' PID    CPU(avg)%  MEM%  STATE COMMAND', curses.A_UNDERLINE)
+        count = height - 8
+        offset = viewport(selected_index(rows, identity), offset, count)
+        offset = min(offset, max(0, len(rows) - count))
+        for index, (process_id, fields) in enumerate(rows[offset:offset + count]):
+            y = 4 + index
+            put(screen, y, 0, '{:>7} {:>8} {:>5} {:<5} {}'.format(*fields), curses.A_REVERSE if process_id == identity else 0)
+            hit_rows[y] = process_id
+        if pending:
+            put(screen, height - 3, 0, 'Stop PID {}: {}?'.format(pending[0][0], pending[1]), curses.A_BOLD)
+            choices = [('Confirm [y]', 'confirm'), ('Cancel [n]', 'cancel')]
+        else:
+            put(screen, height - 3, 0, message)
+            choices = [('Up', 'up'), ('Down', 'down'), ('Stop [K]', 'stop'), ('Quit', 'quit')]
+        x = 0
+        for label, action in choices:
+            text = '[ {} ]'.format(label)
+            put(screen, height - 2, x, text, curses.A_REVERSE)
+            buttons.append((x, x + len(text), height - 2, action))
+            x += len(text) + 2
+        help_text = ('y: stop | n/Esc: cancel | q: quit both' if pending else
+                     'j/k: move | K: stop | q: quit | Esc: close')
+        put(screen, height - 1, 0, help_text)
+        screen.refresh()
+
+
+def print_stats():
+    # One tracked process, with no shell/sleep/awk descendants left on unload.
+    _, previous = read_cpu(None)
+    time.sleep(0.2)
+    cpu, _ = read_cpu(previous)
+    used, total = read_memory()
+    print('{} {}'.format(round(cpu), round(100 * used / total) if total else 0))
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(
+        description='Linux resource monitor for Omarchy A.',
+        epilog='In the task manager: j/k to move, K to stop, q to quit, Esc to close.')
+    parser.add_argument('--stats', action='store_true',
+                        help='print CPU and RAM percentages once, then exit')
+    args = parser.parse_args()
+    try:
+        if args.stats:
+            print_stats()
+        elif not sys.stdin.isatty() or not sys.stdout.isatty():
+            parser.exit(1, 'Resource Monitor needs an interactive terminal. Use --stats for plain output.\n')
+        else:
+            curses.wrapper(main)
+    except KeyboardInterrupt:
+        pass
+    except (OSError, ValueError, curses.error) as error:
+        parser.exit(1, 'Resource Monitor: {}\n'.format(error))

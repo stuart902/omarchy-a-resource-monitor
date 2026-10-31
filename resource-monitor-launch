@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""Serialize launches and supervise only Resource Monitor's Foot window."""
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+APP_ID = 'tablet-resource-monitor'
+PLUGIN_ID = 'tablet.resource-monitor'
+
+
+def instance_file():
+    runtime = Path(os.environ.get('XDG_RUNTIME_DIR', '/run/user/{}'.format(os.getuid())))
+    # Separate graphical sessions must not focus one another's windows.
+    session = os.environ.get('HYPRLAND_INSTANCE_SIGNATURE', os.environ.get('WAYLAND_DISPLAY', ''))
+    name = hashlib.sha256(session.encode()).hexdigest()[:16]
+    descriptor = os.open(runtime / ('resource-monitor-' + name + '.lock'),
+                         os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    info = os.fstat(descriptor)
+    if info.st_uid != os.getuid() or not stat.S_ISREG(info.st_mode):
+        os.close(descriptor)
+        raise RuntimeError('Unsafe Resource Monitor instance file')
+    # Keep this inode: unlinking a flock file allows two independent locks.
+    return os.fdopen(descriptor, 'r+')
+
+
+def focus_window(pid):
+    try:
+        clients = json.loads(subprocess.check_output(['hyprctl', '-j', 'clients'], text=True, timeout=2))
+        for client in clients:
+            if client.get('pid') == pid and client.get('class') == APP_ID:
+                subprocess.run(['hyprctl', 'dispatch', 'focuswindow', 'address:' + client['address']],
+                               check=True, stdout=subprocess.DEVNULL, timeout=2)
+                return True
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+        pass  # Foot may still be mapping its window. The caller retries.
+    return False
+
+
+def acquire_or_focus(lease, timeout=10):
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            lease.seek(0)
+            try:
+                pid = int(lease.read())
+            except ValueError:
+                pid = None
+            if pid is not None and focus_window(pid):
+                set_widget_enabled(True)
+                return False
+            if time.monotonic() >= deadline:
+                raise RuntimeError('Resource Monitor is running but its window could not be focused')
+            time.sleep(0.05)
+
+
+def set_widget_enabled(enabled):
+    # Mutate settings through the live shell, preserving all unrelated settings.
+    # This unloads only our plugin; never restart or signal the shared desktop.
+    result = subprocess.run(['omarchy-shell', 'shell', 'setPluginEnabled', PLUGIN_ID,
+                             'true' if enabled else 'false'],
+                            check=True, text=True, stdout=subprocess.PIPE, timeout=5)
+    if result.stdout.strip() != 'ok':
+        raise RuntimeError('Shell did not {} Resource Monitor: {}'.format(
+            'enable' if enabled else 'disable', result.stdout.strip()))
+
+
+def supervise(lease):
+    # Only an explicit UI Quit writes this per-launch marker. Foot's exit status
+    # cannot distinguish closing its window from quitting its child application.
+    with tempfile.TemporaryDirectory(prefix='resource-monitor-',
+                                     dir=os.environ.get('XDG_RUNTIME_DIR')) as directory:
+        return supervise_window(lease, Path(directory) / 'quit')
+
+
+def supervise_window(lease, quit_path):
+    terminal = None
+    handlers = {}
+
+    def interrupted(signum, frame):
+        raise SystemExit(128 + signum)
+
+    try:
+        for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+            handlers[signum] = signal.signal(signum, interrupted)
+        set_widget_enabled(True)
+        executable = Path(__file__).resolve().with_name('resource-monitor')
+        terminal = subprocess.Popen(['foot', '--app-id=' + APP_ID, '-T', 'Resource Monitor',
+                                     '-e', str(executable)], start_new_session=True,
+                                    env=dict(os.environ, RESOURCE_MONITOR_QUIT_FILE=str(quit_path)))
+        lease.seek(0)
+        lease.truncate()
+        lease.write(str(terminal.pid))
+        lease.flush()
+        return terminal.wait()
+    finally:
+        # Cleanup holds the instance lock too: a new launch cannot race the
+        # previous instance's disable request. Signals cannot interrupt cleanup.
+        for signum in handlers:
+            signal.signal(signum, signal.SIG_IGN)
+        try:
+            if terminal is not None and terminal.poll() is None:
+                terminal.terminate()
+                try:
+                    terminal.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    terminal.kill()
+                    terminal.wait()
+            # Window close, hangup and crashes leave the bar available to reopen
+            # the manager. Explicit q/Quit shuts down both components.
+            if quit_path.is_file():
+                set_widget_enabled(False)
+        finally:
+            lease.seek(0)
+            lease.truncate()
+            lease.flush()
+            for signum, handler in handlers.items():
+                signal.signal(signum, handler)
+
+
+def main():
+    try:
+        with instance_file() as lease:
+            if acquire_or_focus(lease):
+                return supervise(lease)
+        return 0
+    except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+        print('Resource Monitor: {}'.format(error), file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

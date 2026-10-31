@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "id": "tablet.resource-monitor",
+  "name": "Resource Monitor",
+  "version": "1.0.1",
+  "author": "tablet",
+  "description": "Live CPU and memory use with a task-manager launcher",
+  "kinds": ["bar-widget"],
+  "entryPoints": {"barWidget": "BarWidget.qml"},
+  "barWidget": {
+    "displayName": "Resource Monitor",
+    "description": "Live CPU and memory use; opens the task manager",
+    "category": "System",
+    "allowMultiple": false
+  }
+}
